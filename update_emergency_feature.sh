@@ -1,0 +1,613 @@
+#!/bin/bash
+set -e
+cd "$(dirname "$0")"
+mkdir -p templates
+cat > database.py << 'DATABASE_PYEOF'
+"""
+database.py
+Thin SQLite wrapper for EmotiBot check-in logs.
+Creates emotibot.db in the same folder on first run.
+"""
+
+import sqlite3
+from datetime import datetime
+from pathlib import Path
+
+DB_PATH = Path(__file__).parent / "emotibot.db"
+
+# columns added after the original release -- init_db() migrates any
+# existing emotibot.db in place via ALTER TABLE, so nobody has to delete
+# their check-in history to get the new fields.
+_NEW_COLUMNS = {
+    "sleep_hours": "REAL",
+    "vitamin_taken": "INTEGER",
+    "physical_symptoms": "TEXT",
+    "symptom_flag": "TEXT",
+    "emergency_alert": "TEXT",
+}
+
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS checkins (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            dominant_emotion TEXT,
+            emotion_confidence REAL,
+            self_reported_mood TEXT,
+            mood_flag TEXT,
+            water_intake_glasses INTEGER,
+            notes TEXT
+        )
+        """
+    )
+
+    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(checkins)")}
+    for col, coltype in _NEW_COLUMNS.items():
+        if col not in existing_cols:
+            conn.execute(f"ALTER TABLE checkins ADD COLUMN {col} {coltype}")
+
+    conn.commit()
+    conn.close()
+
+
+def log_checkin(dominant_emotion, emotion_confidence, self_reported_mood,
+                 mood_flag, water_intake_glasses, sleep_hours=-1,
+                 vitamin_taken=None, physical_symptoms="", symptom_flag="normal",
+                 emergency_alert="", notes=""):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        """
+        INSERT INTO checkins
+            (timestamp, dominant_emotion, emotion_confidence,
+             self_reported_mood, mood_flag, water_intake_glasses,
+             sleep_hours, vitamin_taken, physical_symptoms, symptom_flag,
+             emergency_alert, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            datetime.now().isoformat(timespec="seconds"),
+            str(dominant_emotion),
+            # cast to native Python types -- numpy scalars (e.g. from
+            # DeepFace) get silently stored as BLOB/bytes by sqlite3
+            # otherwise, which later breaks JSON serialization
+            float(emotion_confidence) if emotion_confidence is not None else 0.0,
+            str(self_reported_mood),
+            str(mood_flag),
+            int(water_intake_glasses) if water_intake_glasses is not None else -1,
+            float(sleep_hours) if sleep_hours is not None else -1.0,
+            int(bool(vitamin_taken)) if vitamin_taken is not None else None,
+            str(physical_symptoms),
+            str(symptom_flag),
+            str(emergency_alert),
+            str(notes),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_all_checkins():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT * FROM checkins ORDER BY timestamp DESC"
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+if __name__ == "__main__":
+    init_db()
+    print(f"Initialized database at {DB_PATH}")
+DATABASE_PYEOF
+cat > main.py << 'MAIN_PYEOF'
+"""
+main.py
+The 50% software demo loop for EmotiBot:
+  1. Observe  -> webcam captures facial emotion for a few seconds
+  2. Interact -> robot asks about water, sleep, vitamin, symptoms, and
+                 mood, by voice
+  3. Decision -> simple rule checks for concerning language / symptoms
+  4. Log      -> everything is written to emotibot.db for the dashboard
+
+Run:
+    python main.py
+Then view the dashboard with:
+    python app.py
+"""
+
+import database
+import emotion_module
+import voice_module
+
+# Minimal, non-diagnostic safety net matching the ppt's "Safe Escalation"
+# slide: certain phrases bypass the normal flow and show a helpline
+# immediately instead of being logged as an ordinary mood entry.
+_CRISIS_WORDS = {
+    "suicidal", "suicide", "self-harm", "self harm", "hurt myself",
+    "harm myself", "kill myself", "end my life", "want to die",
+    "going to die", "gonna die", "don't want to be here",
+    "not worth living", "no point living", "no point in living",
+    "better off dead", "better off without me", "can't go on",
+    "cant go on", "give up on life",
+}
+
+_HELPLINE_MESSAGE = (
+    "I want to make sure you're supported right now. Please reach out to "
+    "a trusted person or a professional helpline — you don't have to "
+    "handle this alone. In India, iCall is available at 9152987821."
+)
+
+_SEEK_CARE_MESSAGE = (
+    "Some of what you mentioned is worth telling your doctor or midwife "
+    "about promptly, rather than waiting for your next appointment."
+)
+
+# Simulated only -- no real message is sent anywhere. A real version would
+# need a messaging service (e.g. email via smtplib, or SMS via a provider
+# like Twilio) plus a proper consent flow for storing a contact's details.
+EMERGENCY_CONTACT_NAME = "your emergency contact"
+
+
+def run_checkin():
+    database.init_db()
+
+    print("\n--- EmotiBot Daily Check-in ---")
+    print("Step 1/6: Reading facial expression (look at the camera)...")
+    emotion, confidence, _ = emotion_module.capture_emotion(duration_seconds=5)
+    if emotion is None:
+        print("No face detected — continuing with voice check-in only.")
+        emotion, confidence = "unknown", 0.0
+    else:
+        print(f"Detected dominant emotion: {emotion} ({confidence})")
+
+    voice_module.speak("Hi, let's do your daily check-in.")
+
+    print("Step 2/6: Asking about water intake...")
+    water_glasses = voice_module.ask_water_intake()
+
+    print("Step 3/6: Asking about sleep...")
+    sleep_hours = voice_module.ask_sleep()
+
+    print("Step 4/6: Asking about prenatal vitamin...")
+    vitamin_taken = voice_module.ask_vitamin()
+
+    print("Step 5/6: Asking about physical symptoms...")
+    symptom_text, symptom_flag = voice_module.ask_symptoms()
+    if symptom_flag == "seek_care":
+        voice_module.speak(_SEEK_CARE_MESSAGE)
+
+    print("Step 6/6: Asking about mood...")
+    mood_text, mood_flag = voice_module.ask_mood()
+
+    # crisis bypass check — never logged as a routine "distress" entry silently;
+    # still logged, but the user is shown a helpline immediately.
+    emergency_alert = ""
+    if any(phrase in mood_text for phrase in _CRISIS_WORDS):
+        voice_module.speak(_HELPLINE_MESSAGE)
+        mood_flag = "crisis_escalation"
+        emergency_alert = f"[SIMULATED] Would notify {EMERGENCY_CONTACT_NAME} now — mental health crisis phrase detected."
+        voice_module.speak(f"For this demo, I would also be notifying {EMERGENCY_CONTACT_NAME} right now.")
+    elif symptom_flag == "seek_care":
+        emergency_alert = f"[SIMULATED] Would notify {EMERGENCY_CONTACT_NAME} now — symptom flagged for prompt care."
+
+    database.log_checkin(
+        dominant_emotion=emotion,
+        emotion_confidence=confidence,
+        self_reported_mood=mood_text,
+        mood_flag=mood_flag,
+        water_intake_glasses=water_glasses,
+        sleep_hours=sleep_hours,
+        vitamin_taken=vitamin_taken,
+        physical_symptoms=symptom_text,
+        symptom_flag=symptom_flag,
+        emergency_alert=emergency_alert,
+        notes="",
+    )
+
+    if mood_flag == "distress" or (emotion in ("sad", "fear", "angry") and mood_flag != "positive"):
+        voice_module.speak(
+            "Thanks for sharing. I've noted how you're feeling today — "
+            "remember it's okay to reach out to your care provider if this continues."
+        )
+    else:
+        voice_module.speak("Thanks! Your check-in has been logged. Take care of yourself today.")
+
+    print("\nCheck-in complete and saved. Run 'python app.py' to view the dashboard.")
+
+
+if __name__ == "__main__":
+    run_checkin()
+MAIN_PYEOF
+cat > app.py << 'APP_PYEOF'
+"""
+app.py
+Flask dashboard that reads emotibot.db and displays check-in history.
+Run:
+    python app.py
+Then open http://127.0.0.1:5000 in a browser.
+"""
+
+from collections import Counter
+
+from flask import Flask, render_template
+
+import database
+
+app = Flask(__name__)
+
+
+def _avg(values):
+    values = [v for v in values if v is not None and v >= 0]
+    return round(sum(values) / len(values), 1) if values else 0
+
+
+@app.route("/")
+def dashboard():
+    database.init_db()
+    checkins = database.get_all_checkins()
+
+    total = len(checkins)
+    avg_water = _avg([c["water_intake_glasses"] for c in checkins])
+    avg_sleep = _avg([c.get("sleep_hours") for c in checkins])
+
+    vitamin_days = [c for c in checkins if c.get("vitamin_taken") is not None]
+    vitamin_pct = (
+        round(100 * sum(1 for c in vitamin_days if c["vitamin_taken"]) / len(vitamin_days))
+        if vitamin_days else None
+    )
+
+    distress_count = len([c for c in checkins if c["mood_flag"] in ("distress", "crisis_escalation")])
+    seek_care_count = len([c for c in checkins if c.get("symptom_flag") == "seek_care"])
+    alert_count = len([c for c in checkins if c.get("emergency_alert")])
+
+    mood_counts = Counter(c["mood_flag"] for c in checkins)
+    emotion_counts = Counter(c["dominant_emotion"] for c in checkins)
+
+    return render_template(
+        "dashboard.html",
+        checkins=checkins,
+        total=total,
+        avg_water=avg_water,
+        avg_sleep=avg_sleep,
+        vitamin_pct=vitamin_pct,
+        distress_count=distress_count,
+        seek_care_count=seek_care_count,
+        alert_count=alert_count,
+        mood_counts=dict(mood_counts),
+        emotion_counts=dict(emotion_counts),
+    )
+
+
+if __name__ == "__main__":
+    app.run(debug=True)
+APP_PYEOF
+cat > templates/dashboard.html << 'TEMPLATES_DASHBOARD_HTMLEOF'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>EmotiBot — Wellbeing Log</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #F3F1F7;
+    --card: #FFFFFF;
+    --ink: #2B2733;
+    --ink-soft: #675F73;
+    --plum: #7C6A8E;
+    --sage: #7E9A82;
+    --rose: #C97B6E;
+    --line: #E4DFEC;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: 'Inter', sans-serif;
+    line-height: 1.5;
+  }
+  header {
+    padding: 48px 32px 32px;
+    max-width: 960px;
+    margin: 0 auto;
+  }
+  header h1 {
+    font-family: 'Fraunces', serif;
+    font-weight: 500;
+    font-size: 2.4rem;
+    margin: 0 0 6px;
+    color: var(--ink);
+  }
+  header p {
+    margin: 0;
+    color: var(--ink-soft);
+    max-width: 46ch;
+  }
+  main {
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 0 32px 64px;
+  }
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 16px;
+    margin: 32px 0;
+  }
+  .stat {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 20px;
+  }
+  .stat .value {
+    font-family: 'Fraunces', serif;
+    font-size: 2rem;
+    color: var(--plum);
+  }
+  .stat .label {
+    color: var(--ink-soft);
+    font-size: 0.9rem;
+  }
+  .chart-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+    margin-bottom: 32px;
+  }
+  .chart-card {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 24px;
+  }
+  .chart-card h2 {
+    font-family: 'Fraunces', serif;
+    font-weight: 500;
+    font-size: 1.2rem;
+    margin: 0 0 16px;
+  }
+  .chart-card canvas {
+    max-height: 220px;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    overflow: hidden;
+    font-size: 0.85rem;
+  }
+  th, td {
+    text-align: left;
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--line);
+  }
+  th {
+    color: var(--ink-soft);
+    font-weight: 500;
+  }
+  tr:last-child td { border-bottom: none; }
+  .badge {
+    display: inline-block;
+    padding: 3px 10px;
+    border-radius: 20px;
+    font-size: 0.8rem;
+  }
+  .badge.positive { background: #E7EFE8; color: var(--sage); }
+  .badge.neutral { background: #EFECF5; color: var(--plum); }
+  .badge.distress, .badge.crisis_escalation { background: #F5E7E4; color: var(--rose); }
+  .empty {
+    padding: 48px;
+    text-align: center;
+    color: var(--ink-soft);
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>EmotiBot Wellbeing Log</h1>
+  <p>A running record of daily check-ins — facial cues from the webcam
+     paired with what you actually said, so nothing gets lost between
+     appointments.</p>
+</header>
+<main>
+  <div class="stats">
+    <div class="stat">
+      <div class="value">{{ total }}</div>
+      <div class="label">Check-ins logged</div>
+    </div>
+    <div class="stat">
+      <div class="value">{{ avg_water }}</div>
+      <div class="label">Avg. glasses of water / day</div>
+    </div>
+    <div class="stat">
+      <div class="value">{{ avg_sleep }}</div>
+      <div class="label">Avg. hours of sleep</div>
+    </div>
+    <div class="stat">
+      <div class="value">{{ vitamin_pct ~ "%" if vitamin_pct is not none else "—" }}</div>
+      <div class="label">Vitamin adherence</div>
+    </div>
+    <div class="stat">
+      <div class="value">{{ distress_count }}</div>
+      <div class="label">Flagged for gentle follow-up</div>
+    </div>
+    <div class="stat">
+      <div class="value">{{ seek_care_count }}</div>
+      <div class="label">Symptoms flagged for provider</div>
+    </div>
+    <div class="stat">
+      <div class="value">{{ alert_count }}</div>
+      <div class="label">Emergency contact alerts (simulated)</div>
+    </div>
+  </div>
+
+  {% if checkins %}
+  <div class="chart-row">
+    <div class="chart-card">
+      <h2>Water intake over time</h2>
+      <canvas id="waterChart" height="90"></canvas>
+    </div>
+    <div class="chart-card">
+      <h2>Sleep over time</h2>
+      <canvas id="sleepChart" height="90"></canvas>
+    </div>
+  </div>
+
+  <div class="chart-row">
+    <div class="chart-card">
+      <h2>Mood check-ins by flag</h2>
+      <canvas id="moodChart" height="90"></canvas>
+    </div>
+    <div class="chart-card">
+      <h2>Facial emotion distribution</h2>
+      <canvas id="emotionChart" height="90"></canvas>
+    </div>
+  </div>
+
+  <table>
+    <thead>
+      <tr>
+        <th>When</th>
+        <th>Facial cue</th>
+        <th>Water</th>
+        <th>Sleep</th>
+        <th>Vitamin</th>
+        <th>Symptoms</th>
+        <th>Mood</th>
+        <th>Flag</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for c in checkins %}
+      <tr>
+        <td>{{ c.timestamp }}</td>
+        <td>{{ c.dominant_emotion }}</td>
+        <td>{{ c.water_intake_glasses if c.water_intake_glasses is not none and c.water_intake_glasses >= 0 else "—" }}</td>
+        <td>{{ c.sleep_hours if c.sleep_hours is not none and c.sleep_hours >= 0 else "—" }}</td>
+        <td>{{ "Yes" if c.vitamin_taken == 1 else ("No" if c.vitamin_taken == 0 else "—") }}</td>
+        <td>
+          {{ c.physical_symptoms }}
+          {% if c.symptom_flag == "seek_care" %}<span class="badge distress">seek care</span>{% endif %}
+          {% if c.get("emergency_alert") %}<br><span class="badge crisis_escalation">contact alerted (sim)</span>{% endif %}
+        </td>
+        <td>{{ c.self_reported_mood }}</td>
+        <td><span class="badge {{ c.mood_flag }}">{{ c.mood_flag }}</span></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <div class="empty">
+    No check-ins yet. Run <code>python main.py</code> to log your first one.
+  </div>
+  {% endif %}
+</main>
+
+<script>
+  const checkins = {{ checkins | tojson }};
+  if (checkins.length) {
+    const ordered = [...checkins].reverse();
+    const labels = ordered.map(c => c.timestamp.slice(5, 16));
+
+    new Chart(document.getElementById('waterChart'), {
+      type: 'line',
+      data: {
+        labels: labels,
+        datasets: [{
+          label: 'Glasses of water',
+          data: ordered.map(c => c.water_intake_glasses >= 0 ? c.water_intake_glasses : null),
+          borderColor: '#7C6A8E',
+          backgroundColor: 'rgba(124,106,142,0.12)',
+          tension: 0.3,
+          fill: true,
+          spanGaps: true,
+        }]
+      },
+      options: {
+        maintainAspectRatio: false,
+        plugins: { legend: { display: false } },
+        scales: { y: { beginAtZero: true } }
+      }
+    });
+
+    new Chart(document.getElementById('sleepChart'), {
+      type: 'line',
+      data: {
+        labels: labels,
+        datasets: [{
+          label: 'Hours of sleep',
+          data: ordered.map(c => (c.sleep_hours !== undefined && c.sleep_hours >= 0) ? c.sleep_hours : null),
+          borderColor: '#7E9A82',
+          backgroundColor: 'rgba(126,154,130,0.12)',
+          tension: 0.3,
+          fill: true,
+          spanGaps: true,
+        }]
+      },
+      options: {
+        maintainAspectRatio: false,
+        plugins: { legend: { display: false } },
+        scales: { y: { beginAtZero: true } }
+      }
+    });
+
+    const moodCounts = {{ mood_counts | tojson }};
+    const moodColors = {
+      positive: '#7E9A82',
+      neutral: '#7C6A8E',
+      distress: '#C97B6E',
+      crisis_escalation: '#B0453A',
+    };
+    new Chart(document.getElementById('moodChart'), {
+      type: 'bar',
+      data: {
+        labels: Object.keys(moodCounts),
+        datasets: [{
+          data: Object.values(moodCounts),
+          backgroundColor: Object.keys(moodCounts).map(k => moodColors[k] || '#7C6A8E'),
+          borderRadius: 4,
+        }]
+      },
+      options: {
+        maintainAspectRatio: false,
+        plugins: { legend: { display: false } },
+        scales: { y: { beginAtZero: true, ticks: { stepSize: 1 } } }
+      }
+    });
+
+    const emotionCounts = {{ emotion_counts | tojson }};
+    new Chart(document.getElementById('emotionChart'), {
+      type: 'bar',
+      data: {
+        labels: Object.keys(emotionCounts),
+        datasets: [{
+          data: Object.values(emotionCounts),
+          backgroundColor: '#7C6A8E',
+          borderRadius: 4,
+        }]
+      },
+      options: {
+        indexAxis: 'y',
+        maintainAspectRatio: false,
+        plugins: { legend: { display: false } },
+        scales: { x: { beginAtZero: true, ticks: { stepSize: 1 } } }
+      }
+    });
+  }
+</script>
+</body>
+</html>
+TEMPLATES_DASHBOARD_HTMLEOF
+echo "All files updated (database.py, main.py, app.py, templates/dashboard.html)."
+grep -c "SIMULATED" main.py

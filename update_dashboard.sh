@@ -1,0 +1,327 @@
+#!/bin/bash
+set -e
+cd "$(dirname "$0")"
+
+mkdir -p templates
+cat > templates/dashboard.html << 'DASHEOF'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>EmotiBot — Wellbeing Log</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #F3F1F7;
+    --card: #FFFFFF;
+    --ink: #2B2733;
+    --ink-soft: #675F73;
+    --plum: #7C6A8E;
+    --sage: #7E9A82;
+    --rose: #C97B6E;
+    --line: #E4DFEC;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: 'Inter', sans-serif;
+    line-height: 1.5;
+  }
+  header {
+    padding: 48px 32px 32px;
+    max-width: 960px;
+    margin: 0 auto;
+  }
+  header h1 {
+    font-family: 'Fraunces', serif;
+    font-weight: 500;
+    font-size: 2.4rem;
+    margin: 0 0 6px;
+    color: var(--ink);
+  }
+  header p {
+    margin: 0;
+    color: var(--ink-soft);
+    max-width: 46ch;
+  }
+  main {
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 0 32px 64px;
+  }
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 16px;
+    margin: 32px 0;
+  }
+  .stat {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 20px;
+  }
+  .stat .value {
+    font-family: 'Fraunces', serif;
+    font-size: 2rem;
+    color: var(--plum);
+  }
+  .stat .label {
+    color: var(--ink-soft);
+    font-size: 0.9rem;
+  }
+  .chart-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+    margin-bottom: 32px;
+  }
+  .chart-card {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 24px;
+  }
+  .chart-card h2 {
+    font-family: 'Fraunces', serif;
+    font-weight: 500;
+    font-size: 1.2rem;
+    margin: 0 0 16px;
+  }
+  .chart-card canvas {
+    max-height: 220px;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    overflow: hidden;
+    font-size: 0.85rem;
+  }
+  th, td {
+    text-align: left;
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--line);
+  }
+  th {
+    color: var(--ink-soft);
+    font-weight: 500;
+  }
+  tr:last-child td { border-bottom: none; }
+  .badge {
+    display: inline-block;
+    padding: 3px 10px;
+    border-radius: 20px;
+    font-size: 0.8rem;
+  }
+  .badge.positive { background: #E7EFE8; color: var(--sage); }
+  .badge.neutral { background: #EFECF5; color: var(--plum); }
+  .badge.distress, .badge.crisis_escalation { background: #F5E7E4; color: var(--rose); }
+  .empty {
+    padding: 48px;
+    text-align: center;
+    color: var(--ink-soft);
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>EmotiBot Wellbeing Log</h1>
+  <p>A running record of daily check-ins — facial cues from the webcam
+     paired with what you actually said, so nothing gets lost between
+     appointments.</p>
+</header>
+<main>
+  <div class="stats">
+    <div class="stat">
+      <div class="value">{{ total }}</div>
+      <div class="label">Check-ins logged</div>
+    </div>
+    <div class="stat">
+      <div class="value">{{ avg_water }}</div>
+      <div class="label">Avg. glasses of water / day</div>
+    </div>
+    <div class="stat">
+      <div class="value">{{ avg_sleep }}</div>
+      <div class="label">Avg. hours of sleep</div>
+    </div>
+    <div class="stat">
+      <div class="value">{{ vitamin_pct ~ "%" if vitamin_pct is not none else "—" }}</div>
+      <div class="label">Vitamin adherence</div>
+    </div>
+    <div class="stat">
+      <div class="value">{{ distress_count }}</div>
+      <div class="label">Flagged for gentle follow-up</div>
+    </div>
+    <div class="stat">
+      <div class="value">{{ seek_care_count }}</div>
+      <div class="label">Symptoms flagged for provider</div>
+    </div>
+  </div>
+
+  {% if checkins %}
+  <div class="chart-row">
+    <div class="chart-card">
+      <h2>Water intake over time</h2>
+      <canvas id="waterChart" height="90"></canvas>
+    </div>
+    <div class="chart-card">
+      <h2>Sleep over time</h2>
+      <canvas id="sleepChart" height="90"></canvas>
+    </div>
+  </div>
+
+  <div class="chart-row">
+    <div class="chart-card">
+      <h2>Mood check-ins by flag</h2>
+      <canvas id="moodChart" height="90"></canvas>
+    </div>
+    <div class="chart-card">
+      <h2>Facial emotion distribution</h2>
+      <canvas id="emotionChart" height="90"></canvas>
+    </div>
+  </div>
+
+  <table>
+    <thead>
+      <tr>
+        <th>When</th>
+        <th>Facial cue</th>
+        <th>Water</th>
+        <th>Sleep</th>
+        <th>Vitamin</th>
+        <th>Symptoms</th>
+        <th>Mood</th>
+        <th>Flag</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for c in checkins %}
+      <tr>
+        <td>{{ c.timestamp }}</td>
+        <td>{{ c.dominant_emotion }}</td>
+        <td>{{ c.water_intake_glasses if c.water_intake_glasses is not none and c.water_intake_glasses >= 0 else "—" }}</td>
+        <td>{{ c.sleep_hours if c.sleep_hours is not none and c.sleep_hours >= 0 else "—" }}</td>
+        <td>{{ "Yes" if c.vitamin_taken == 1 else ("No" if c.vitamin_taken == 0 else "—") }}</td>
+        <td>
+          {{ c.physical_symptoms }}
+          {% if c.symptom_flag == "seek_care" %}<span class="badge distress">seek care</span>{% endif %}
+        </td>
+        <td>{{ c.self_reported_mood }}</td>
+        <td><span class="badge {{ c.mood_flag }}">{{ c.mood_flag }}</span></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <div class="empty">
+    No check-ins yet. Run <code>python main.py</code> to log your first one.
+  </div>
+  {% endif %}
+</main>
+
+<script>
+  const checkins = {{ checkins | tojson }};
+  if (checkins.length) {
+    const ordered = [...checkins].reverse();
+    const labels = ordered.map(c => c.timestamp.slice(5, 16));
+
+    new Chart(document.getElementById('waterChart'), {
+      type: 'line',
+      data: {
+        labels: labels,
+        datasets: [{
+          label: 'Glasses of water',
+          data: ordered.map(c => c.water_intake_glasses >= 0 ? c.water_intake_glasses : null),
+          borderColor: '#7C6A8E',
+          backgroundColor: 'rgba(124,106,142,0.12)',
+          tension: 0.3,
+          fill: true,
+          spanGaps: true,
+        }]
+      },
+      options: {
+        maintainAspectRatio: false,
+        plugins: { legend: { display: false } },
+        scales: { y: { beginAtZero: true } }
+      }
+    });
+
+    new Chart(document.getElementById('sleepChart'), {
+      type: 'line',
+      data: {
+        labels: labels,
+        datasets: [{
+          label: 'Hours of sleep',
+          data: ordered.map(c => (c.sleep_hours !== undefined && c.sleep_hours >= 0) ? c.sleep_hours : null),
+          borderColor: '#7E9A82',
+          backgroundColor: 'rgba(126,154,130,0.12)',
+          tension: 0.3,
+          fill: true,
+          spanGaps: true,
+        }]
+      },
+      options: {
+        maintainAspectRatio: false,
+        plugins: { legend: { display: false } },
+        scales: { y: { beginAtZero: true } }
+      }
+    });
+
+    const moodCounts = {{ mood_counts | tojson }};
+    const moodColors = {
+      positive: '#7E9A82',
+      neutral: '#7C6A8E',
+      distress: '#C97B6E',
+      crisis_escalation: '#B0453A',
+    };
+    new Chart(document.getElementById('moodChart'), {
+      type: 'bar',
+      data: {
+        labels: Object.keys(moodCounts),
+        datasets: [{
+          data: Object.values(moodCounts),
+          backgroundColor: Object.keys(moodCounts).map(k => moodColors[k] || '#7C6A8E'),
+          borderRadius: 4,
+        }]
+      },
+      options: {
+        maintainAspectRatio: false,
+        plugins: { legend: { display: false } },
+        scales: { y: { beginAtZero: true, ticks: { stepSize: 1 } } }
+      }
+    });
+
+    const emotionCounts = {{ emotion_counts | tojson }};
+    new Chart(document.getElementById('emotionChart'), {
+      type: 'bar',
+      data: {
+        labels: Object.keys(emotionCounts),
+        datasets: [{
+          data: Object.values(emotionCounts),
+          backgroundColor: '#7C6A8E',
+          borderRadius: 4,
+        }]
+      },
+      options: {
+        indexAxis: 'y',
+        maintainAspectRatio: false,
+        plugins: { legend: { display: false } },
+        scales: { x: { beginAtZero: true, ticks: { stepSize: 1 } } }
+      }
+    });
+  }
+</script>
+</body>
+</html>
+DASHEOF
+
+echo "templates/dashboard.html updated."
+grep "jsdelivr" templates/dashboard.html
